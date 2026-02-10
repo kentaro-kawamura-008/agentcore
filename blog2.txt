@@ -1,0 +1,441 @@
+Google Workspace や Google Cloud の最新情報を発信する「G-gen Tech Blog」のスタイルに合わせ、ご提示いただいたハンズオン内容をブログ記事化しました。
+
+---
+
+# 実機不要！「Gemini Robotics-ER 1.5」で学ぶフィジカルAI入門 2 を徹底解説！ - G-gen Tech Blog
+
+こんにちは。G-gen のエンジニアです。
+
+Google から発表された、オフラインでも動作し、ロボットの「高レベルな脳」として機能する **Gemini Robotics-ER 1.5**。
+前回の第一弾に続き、今回はより実践的な**「動画からの状態推定 → 計画 → 進捗判定」という一連の閉ループ（クローズドループ）制御**を構築するハンズオンを解説します。
+
+物理的なロボットの実機がなくても、Google Colab 上で動画解析から疑似的な実行までを体験できる内容となっています。
+
+---
+
+## 1. 概要
+
+Gemini Robotics-ER 1.5 は、視覚・空間理解、計画立案、進捗推定、そしてユーザー定義関数の呼び出し（ツール呼び出し）を統合的に行えるモデルです。
+
+本ハンズオンでは、動画を入力として、AI が「何がどこにあるか」を把握し、目標に向けた「計画」を立て、実際にステップを進めながら「正しく完了したか」を判定するプロセスを実装します。
+
+### このハンズオンで作るもの（完成形）
+
+*   **入力**：作業台などを映した短い動画（10〜30秒程度）
+*   **出力**：
+    1.  各フレームの物体検出（point/bbox）
+    2.  同一物体のトラッキング（ID付与）
+    3.  目標（Goal）に基づいた行動計画（Plan）の生成
+    4.  疑似ロボットAPIによるステップ実行
+    5.  進捗（Progress）と成功（Success）の判定による閉ループ制御
+
+---
+
+## 2. 利用の前提条件
+
+本ハンズオンを進めるにあたり、以下の環境が必要です。
+
+*   **Google Colab** が利用可能であること
+*   **Gemini API Key**（Google AI Studio で作成）
+*   **テスト用動画 1本**（10〜30秒程度の mp4 推奨）
+
+なお、本記事でも座標系は **[y, x] 形式の 0–1000 正規化** を使用します。これにより、画像サイズに依存せず汎用的に座標を扱うことが可能です。
+
+---
+
+## 3. 利用方法
+
+ここからは、具体的な実装手順とコードを見ていきましょう。
+
+### 3.1 事前準備（ライブラリとAPIキー）
+
+まず、必要なライブラリをインストールし、APIキーを設定します。
+
+```bash
+%pip -q install -U google-genai pillow matplotlib opencv-python
+```
+
+```python
+from google.colab import userdata
+import os
+
+key = userdata.get("GOOGLE_API_KEY") or userdata.get("GEMINI_API_KEY")
+assert key, "Colab Secrets に GOOGLE_API_KEY か GEMINI_API_KEY を設定してください"
+os.environ["GOOGLE_API_KEY"] = key
+print("API Key loaded.")
+```
+
+### 3.2 動画のアップロードとフレーム抽出
+
+解析対象となる動画をアップロードし、等間隔（例：1fps）で静止画として抽出します。
+
+```python
+from google.colab import files
+uploaded = files.upload()
+video_path = next(iter(uploaded.keys()))
+print("uploaded:", video_path)
+```
+
+```python
+import cv2
+import os
+
+out_dir = "frames"
+os.makedirs(out_dir, exist_ok=True)
+
+cap = cv2.VideoCapture(video_path)
+fps = cap.get(cv2.CAP_PROP_FPS)
+total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+duration = total / fps if fps else 0
+print(f"fps={fps:.2f}, frames={total}, duration={duration:.1f}s")
+
+sample_fps = 1.0  # 1秒に1枚
+step = int(round(fps / sample_fps)) if fps else 1
+step = max(step, 1)
+
+frames = []
+idx = 0
+saved = 0
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    if idx % step == 0:
+        # BGR -> RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        path = f"{out_dir}/frame_{saved:04d}.jpg"
+        cv2.imwrite(path, cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+        frames.append(path)
+        saved += 1
+    idx += 1
+cap.release()
+
+print("saved frames:", len(frames))
+print("example:", frames[:3])
+```
+
+### 3.3 物体検出（Perceive）
+
+Gemini Robotics-ER 1.5 を使い、各フレームから物体の座標を取得します。検出タスクでは低レイテンシを実現するため、`thinking_budget=0`（思考プロセスの無効化）を設定するのがコツです。
+
+```python
+import json
+from google import genai
+from google.genai import types
+
+MODEL = "gemini-robotics-er-1.5-preview"  # preview 
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+def parse_json(text: str):
+    # Quickstart由来の簡易フェンス除去 
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "```json":
+            text = "\n".join(lines[i+1:])
+            text = text.split("```")[0]
+            break
+    return json.loads(text)
+
+def guess_mime(path: str) -> str:
+    ext = path.lower().split(".")[-1]
+    return "image/png" if ext == "png" else "image/jpeg"
+
+DETECT_PROMPT = """
+Detect up to 12 objects in the image.
+Return JSON ONLY (no code fences).
+Format:
+{
+  "objects": [
+    {"label": "<name>", "point": [y, x], "box_2d": [ymin, xmin, ymax, xmax]}
+  ]
+}
+All coordinates must be integers, [y, x] normalized to 0-1000.
+Only include objects actually present.
+"""
+
+def detect_objects(image_path: str):
+    with open(image_path, "rb") as f:
+        img_bytes = f.read()
+    res = client.models.generate_content(
+        model=MODEL,
+        contents=[types.Part.from_bytes(data=img_bytes, mime_type=guess_mime(image_path)),
+                  DETECT_PROMPT],
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            thinking_config=types.ThinkingConfig(thinking_budget=0)  # low latency 
+        ),
+    )
+    return parse_json(res.text)
+
+detections = []
+for i, fp in enumerate(frames):
+    det = detect_objects(fp)
+    det["frame_index"] = i
+    det["frame_path"] = fp
+    detections.append(det)
+
+print("frames:", len(detections))
+```
+
+### 3.4 可視化による確認
+
+検出された `point` と `box_2d` を画像上に描画して確認します。
+
+```python
+from PIL import Image, ImageDraw
+import matplotlib.pyplot as plt
+
+def to_px_yx(point_yx, W, H):
+    y, x = point_yx
+    px = int(x / 1000 * W)
+    py = int(y / 1000 * H)
+    return px, py
+
+def box_to_px(box, W, H):
+    ymin, xmin, ymax, xmax = box
+    x1 = int(xmin/1000 * W); y1 = int(ymin/1000 * H)
+    x2 = int(xmax/1000 * W); y2 = int(ymax/1000 * H)
+    return x1, y1, x2, y2
+
+def visualize_frame(det, max_labels=12):
+    img = Image.open(det["frame_path"]).convert("RGB")
+    W, H = img.size
+    vis = img.copy()
+    draw = ImageDraw.Draw(vis)
+
+    for obj in det["objects"][:max_labels]:
+        if "box_2d" in obj:
+            x1, y1, x2, y2 = box_to_px(obj["box_2d"], W, H)
+            draw.rectangle((x1, y1, x2, y2), outline="lime", width=3)
+        if "point" in obj:
+            px, py = to_px_yx(obj["point"], W, H)
+            r = 5
+            draw.ellipse((px-r, py-r, px+r, py+r), outline="red", width=3)
+            draw.text((px+6, py+6), obj["label"], fill="red")
+
+    plt.figure(figsize=(10,6))
+    plt.imshow(vis)
+    plt.axis("off")
+    plt.show()
+
+visualize_frame(detections[0])
+```
+
+### 3.5 簡易トラッキング（ID付与）
+
+連続するフレーム間で、物体の移動を追いかけるために `track_id` を付与します。
+
+```python
+import math
+
+def dist(p1, p2):
+    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+
+next_id = 0
+prev_tracks = []  # list of (track_id, label, point)
+
+for det in detections:
+    tracks = []
+    for obj in det["objects"]:
+        if "point" not in obj:
+            continue
+        best = None
+        best_d = 1e9
+
+        for (tid, plabel, ppoint) in prev_tracks:
+            d = dist(obj["point"], ppoint)
+            if d < best_d and d < 120:  # 0-1000正規化空間での閾値
+                best = tid
+                best_d = d
+
+        if best is None:
+            best = next_id
+            next_id += 1
+
+        obj["track_id"] = best
+        tracks.append((best, obj.get("label",""), obj["point"]))
+
+    det["tracks"] = tracks
+    prev_tracks = tracks
+
+print("max track_id:", next_id-1)
+```
+
+### 3.6 計画（Plan）の生成
+
+今回の目標（Goal）を「机の上の整理」と定義し、計画を立てさせます。計画立案は「じっくり考える」必要があるため、`thinking_budget` を増やして実行します。
+
+```python
+GOAL = """
+Re-organize the tabletop:
+- Put small gadgets (earbuds, mouse, etc.) into Zone_RIGHT.
+- Put stationery (pen, notebook, etc.) into Zone_LEFT.
+If label is unclear, decide based on appearance and common sense.
+"""
+
+PLAN_PROMPT_TMPL = """
+You are a robotics high-level planner.
+Given the current scene objects (with ids and positions) and the goal, output a short plan.
+
+Return JSON ONLY:
+{
+  "plan": [
+    {"step": 1, "action": "pick", "target_track_id": <int>, "rationale": "<short>"},
+    {"step": 2, "action": "place", "zone": "Zone_LEFT|Zone_RIGHT", "rationale": "<short>"}
+  ]
+}
+
+Constraints:
+- Use only actions: pick, place.
+- Max 10 steps.
+- Use target_track_id from the input objects.
+- Prefer a robust order (avoid moving the same item twice).
+"""
+
+def make_plan(scene_det, goal_text):
+    objs = [{"track_id": o.get("track_id"), "label": o.get("label"), "point": o.get("point")}
+            for o in scene_det["objects"] if "track_id" in o and "point" in o]
+    prompt = PLAN_PROMPT_TMPL + "\n\nGOAL:\n" + goal_text + "\n\nOBJECTS:\n" + json.dumps(objs, ensure_ascii=False)
+
+    res = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            thinking_config=types.ThinkingConfig(thinking_budget=256)  # 計画は考えさせる 
+        ),
+    )
+    return parse_json(res.text)
+
+current_scene = detections[-1]
+plan_json = make_plan(current_scene, GOAL)
+print(plan_json)
+```
+
+### 3.7 疑似実行と成功判定（Verify）による閉ループ化
+
+最後に、立てた計画を 1 ステップずつ「実行」し、その都度「進捗と成功」を判定するループを作ります。これがフィジカル AI における「閉ループ制御」の核心部分です。
+
+```python
+# 疑似ワールド状態
+world = {
+    "held": None,
+    "zones": {}  # track_id -> Zone_LEFT / Zone_RIGHT / Unknown
+}
+
+def tool_pick(track_id: int):
+    if world["held"] is not None:
+        return {"ok": False, "msg": "already holding something", "held": world["held"]}
+    world["held"] = track_id
+    return {"ok": True, "msg": f"picked {track_id}", "held": world["held"]}
+
+def tool_place(zone: str):
+    if world["held"] is None:
+        return {"ok": False, "msg": "holding nothing"}
+    tid = world["held"]
+    world["zones"][tid] = zone
+    world["held"] = None
+    return {"ok": True, "msg": f"placed {tid} to {zone}", "zones": world["zones"]}
+
+# 進捗判定プロンプト
+VERIFY_PROMPT_TMPL = """
+You are a progress estimator for a robotics task.
+Given the goal and current symbolic world state, estimate progress and success.
+
+Return JSON ONLY:
+{
+  "progress": <float 0..1>,
+  "success": <true|false>,
+  "blocking_issue": "<short or empty>",
+  "next_suggestion": "<short>"
+}
+
+Be conservative: if unsure, lower progress.
+"""
+
+def verify_progress(goal_text: str, world_state: dict):
+    prompt = VERIFY_PROMPT_TMPL + "\n\nGOAL:\n" + goal_text + "\n\nWORLD:\n" + json.dumps(world_state, ensure_ascii=False)
+    res = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            thinking_config=types.ThinkingConfig(thinking_budget=128)  # 判定は中程度 
+        ),
+    )
+    return parse_json(res.text)
+
+# 閉ループ実行
+logs = []
+steps = plan_json.get("plan", [])
+
+for st in steps:
+    act = st.get("action")
+    if act == "pick":
+        out = tool_pick(int(st["target_track_id"]))
+    elif act == "place":
+        out = tool_place(st["zone"])
+    else:
+        out = {"ok": False, "msg": f"unknown action {act}"}
+
+    chk = verify_progress(GOAL, world)
+    logs.append({"step": st, "tool_out": out, "check": chk})
+
+    print(f"step {st.get('step')}: {act} -> {out.get('msg')}")
+    print("  progress:", chk["progress"], "success:", chk["success"], "issue:", chk["blocking_issue"])
+    if chk["success"] is True:
+        print("✅ Goal achieved. Stop loop.")
+        break
+```
+
+### 3.8 結果の描画
+
+最終的な結果として、どの物体がどのゾーンに分類されたかを可視化します。
+
+```python
+last = detections[-1]
+img = Image.open(last["frame_path"]).convert("RGB")
+W, H = img.size
+vis = img.copy()
+draw = ImageDraw.Draw(vis)
+
+for o in last["objects"]:
+    if "point" not in o or "track_id" not in o:
+        continue
+    tid = o["track_id"]
+    zone = world["zones"].get(tid, "Unknown")
+    px, py = to_px_yx(o["point"], W, H)
+    draw.text((px+6, py+6), f"id={tid} {zone}", fill="yellow")
+
+plt.figure(figsize=(10,6))
+plt.imshow(vis)
+plt.axis("off")
+plt.show()
+```
+
+---
+
+## 4. コンセプト
+
+Gemini Robotics-ER 1.5 の最大の特徴は、推論プロセスを制御する **`thinking_budget`** の活用です。
+
+*   **物体検出（Perceive）**：パターンマッチングに近いため、予算を 0 にして高速化。
+*   **計画立案（Plan）や検証（Verify）**：複雑な状況判断が必要なため、予算を増やしてじっくり考えさせる。
+
+このようにタスクの性質に応じてリソースを配分することで、高精度かつ効率的なロボット制御が可能になります。
+
+---
+
+## 5. まとめ
+
+今回は、Gemini Robotics-ER 1.5 を使い、動画から「状況把握 → 計画 → 実行 → 検証」という閉ループ制御を行うハンズオンを解説しました。
+
+実機がない環境でも、これほど高度なフィジカル AI の挙動をシミュレーションできるのは驚きですね。次世代のロボット開発において、Gemini が強力な「脳」として普及していく未来が楽しみです。
+
+参考：
+* [Introducing Google Workspace Studio: Automate everyday work with AI agents](https://blog.google/products/workspace/google-workspace-studio-ai-agents/)
+* [Google Robotics-ER 1.5 preview documentation](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/)
+
+---
+付： 杉村 勇馬
+執行役員 CTO。クラウド管理・運用やネットワークに知見。Google Cloud 認定資格はすべて取得済み。X（旧 Twitter）でも最新情報を発信しています。
