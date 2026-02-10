@@ -1,0 +1,545 @@
+了解です！\*\*「Pythonは少し読める（for/ifが分かる）」レベル（想定２）**向けに、第三弾を **“1パターン固定”**・**“シミュレーターで動かすことに全集中”\*\*で、**完全なハンズオン手順書**として仕上げます。  
+（専門用語は **出てきた瞬間に必ず丁寧に説明**します。セキュリティ話は入れません。）
+
+***
+
+# 実機不要！フィジカルAI入門3（固定1パターン）
+
+## MuJoCoでロボットを“動かす”：Gemini Robotics‑ER 1.5で計画 → Pick\&Place（赤ブロック→青箱）
+
+**所要時間**：60〜90分  
+**ゴール**：MuJoCo（物理シミュレーター）上で、ロボットアームが **赤いブロックを持ち上げて青い箱に置く**ところを **GIFで確認**する
+
+> Gemini Robotics‑ER 1.5 は、ロボット向けに「視覚・空間理解」「タスク計画」「進捗推定」「ツール連携」を担う高レベルモデルとして提供されています。  
+> DeepMindはロボティクス開発で **MuJoCo** を使った評価・実験の流れも明確にしています（本ハンズオンは“SDK必須”ではなく、MuJoCoで動かす体験に集中します）。 [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/), [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/), [\[binaryverseai.com\]](https://binaryverseai.com/gemini-robotics-1-5-embodied-reasoning/) [\[miralab.co.jp\]](https://miralab.co.jp/media/gemini_robotics_deepmind/), [\[en.wikipedia.org\]](https://en.wikipedia.org/wiki/Gemini_%28language_model%29), [\[watch.impress.co.jp\]](https://www.watch.impress.co.jp/docs/news/1669995.html)
+
+***
+
+## 0. このハンズオンの「固定1パターン」
+
+やることは **1つだけ**です（迷わない設計）。
+
+*   **赤ブロック（`red_block`）をつかんで、青い箱の中心（`blue_bin`）に置く**
+
+***
+
+## 1. 事前準備（前提条件）
+
+*   Google Colabが使える（ブラウザでOK）
+*   Gemini API Key（Google AI Studioで作成済み）
+*   **Pythonは少し読める**（for/ifが分かる）想定
+
+***
+
+## 2. 用語を先に一度だけ（超やさしく）
+
+この後に出る専門用語を、まず “地図” として置きます（本文でも出た瞬間に再説明します）。
+
+*   **MuJoCo（ムジョコ）**：物理シミュレーター。重力や衝突をPC内で計算して、ロボットや物体を「現実っぽく」動かせる。 [\[miralab.co.jp\]](https://miralab.co.jp/media/gemini_robotics_deepmind/), [\[watch.impress.co.jp\]](https://www.watch.impress.co.jp/docs/news/1669995.html)
+*   **関節（joint）**：ロボットの曲がる所（肩・肘）。
+*   **関節角（joint angle）**：関節がどれだけ曲がっているか（数値）。
+*   **エンドエフェクタ（EE / end-effector）**：ロボットの先端（手先）。「手先をここへ動かす」の“手先”。
+*   **逆運動学（IK: Inverse Kinematics）**：  
+    「手先を目標位置に持っていくには、肩と肘を何度にすればいい？」を計算する方法。※本文で丁寧に解説します。
+
+***
+
+# ハンズオン本編（Colab手順）
+
+> ✅ 以下は **セルを上から順に**実行すればOKです。
+
+***
+
+## Step 1) ライブラリをインストール
+
+Colabセルで実行：
+
+```bash
+%pip -q install -U google-genai mujoco imageio matplotlib numpy
+```
+
+***
+
+## Step 2) APIキーを読み込む（Colab Secrets）
+
+Colab の Secrets に `GOOGLE_API_KEY`（または `GEMINI_API_KEY`）を入れておきます。
+
+```python
+from google.colab import userdata
+import os
+
+key = userdata.get("GOOGLE_API_KEY") or userdata.get("GEMINI_API_KEY")
+assert key, "Colab Secrets に GOOGLE_API_KEY か GEMINI_API_KEY を設定してください"
+os.environ["GOOGLE_API_KEY"] = key
+print("API Key loaded.")
+```
+
+***
+
+## Step 3) MuJoCoの“世界”を作る（XMLで定義）
+
+### ✅ 用語解説：XMLってなに？
+
+\*\*XMLは「設定ファイルの書き方」\*\*です。MuJoCoでは、ロボットや物体の形・位置・色・関節などを **XMLで書く**と、その通りに仮想世界が作られます。  
+（「床を置く」「赤い箱を置く」「肩関節を作る」を文章で書くイメージです）
+
+### ✅ 今回のMuJoCoシーン（固定）
+
+*   平面上（床）に
+*   2関節（肩・肘）の簡易アーム
+*   赤ブロック（動かせる）
+*   青箱（置き場の目印）
+
+```python
+import mujoco
+import numpy as np
+
+MODEL_XML = r"""
+<mujoco model="pick_place_demo">
+  <option timestep="0.01" gravity="0 0 -9.81" integrator="RK4"/>
+  <visual>
+    <global offwidth="640" offheight="480"/>
+  </visual>
+
+  <worldbody>
+    <!-- floor -->
+    <geom name="floor" type="plane" pos="0 0 0" size="2 2 0.1" rgba="0.95 0.95 0.95 1"/>
+
+    <!-- simple 2-link arm (planar in x-z) -->
+    <body name="arm_base" pos="-0.4 0 0.05">
+      <geom type="sphere" size="0.03" rgba="0.2 0.2 0.2 1"/>
+
+      <body name="link1" pos="0 0 0">
+        <joint name="shoulder" type="hinge" axis="0 1 0" range="-180 180" damping="2"/>
+        <geom type="capsule" fromto="0 0 0  0.25 0 0" size="0.02" rgba="0.4 0.4 0.4 1"/>
+
+        <body name="link2" pos="0.25 0 0">
+          <joint name="elbow" type="hinge" axis="0 1 0" range="-180 180" damping="2"/>
+          <geom type="capsule" fromto="0 0 0  0.25 0 0" size="0.018" rgba="0.5 0.5 0.5 1"/>
+
+          <!-- end-effector marker -->
+          <site name="ee" pos="0.25 0 0" size="0.01" rgba="1 0.5 0 1"/>
+        </body>
+      </body>
+    </body>
+
+    <!-- red block (free body) -->
+    <body name="red_block" pos="0.15 0 0.025">
+      <freejoint/>
+      <geom type="box" size="0.02 0.02 0.02" rgba="1 0 0 1" density="300"/>
+    </body>
+
+    <!-- blue bin marker -->
+    <geom name="blue_bin" type="box" pos="0.45 0 0.005" size="0.07 0.07 0.005" rgba="0.2 0.3 1 0.5"/>
+  </worldbody>
+
+  <actuator>
+    <position name="a_shoulder" joint="shoulder" kp="40"/>
+    <position name="a_elbow" joint="elbow" kp="30"/>
+  </actuator>
+</mujoco>
+"""
+
+model = mujoco.MjModel.from_xml_string(MODEL_XML)
+data = mujoco.MjData(model)
+mujoco.mj_forward(model, data)
+
+print("Loaded model:",
+      "nq=", model.nq, "(state size)",
+      "nu=", model.nu, "(control size)")
+```
+
+***
+
+## Step 4) 画面に表示する（オフスクリーン描画）
+
+ColabではGUIウィンドウが使いにくいので、**描画→画像表示**で確認します。
+
+```python
+import matplotlib.pyplot as plt
+import imageio
+
+renderer = mujoco.Renderer(model, height=480, width=640)
+
+def render_rgb():
+    renderer.update_scene(data)
+    return renderer.render()
+
+def show(img):
+    plt.figure(figsize=(8,5))
+    plt.imshow(img)
+    plt.axis("off")
+    plt.show()
+
+# 初期状態を表示
+show(render_rgb())
+```
+
+***
+
+## Step 5) 手先（EE）やブロックの位置を取る（座標）
+
+### ✅ 用語解説：座標（position）って？
+
+MuJoCoの世界では、物体の位置は **(x, y, z)** の3つの値で表されます。  
+今回は **平面（x-z）** で動かす簡略化なので、基本は **x と z** を使います（yは固定に近い扱い）。
+
+```python
+def get_site_xpos(site_name="ee"):
+    sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+    return data.site_xpos[sid].copy()
+
+def get_body_xpos(body_name):
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    return data.xpos[bid].copy()
+
+def get_geom_pos(geom_name):
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+    return model.geom_pos[gid].copy()
+
+print("EE:", get_site_xpos("ee"))
+print("Red:", get_body_xpos("red_block"))
+print("Bin:", get_geom_pos("blue_bin"))
+```
+
+***
+
+## Step 6) 逆運動学（IK）で「手先を狙った場所へ」動かす
+
+ここが一番大事なので、丁寧に説明します。
+
+### ✅ 用語解説：逆運動学（IK）とは？
+
+ロボットは普通、「手先を(0.3,0.1)へ移動」ではなく、**肩・肘の角度**で動きます。  
+だから、やりたいのはこれ：
+
+*   **やりたい**：手先（EE）を目標地点へ動かす
+*   **でも実際**：動かせるのは肩・肘の角度
+*   **そこでIK**：「目標地点に行くための肩角度・肘角度を計算」する
+
+今回は “2本腕の平面ロボット” なので、IKを **簡単な計算**で実装できます。
+
+> ※ここでは数式の理解は不要です。  
+> 「(x,z) → (肩角,肘角) に変換する関数」だと思って使えばOKです。
+
+```python
+import numpy as np
+
+def planar_ik(target_x, target_z, base_x=-0.4, base_z=0.05, l1=0.25, l2=0.25, elbow_up=True):
+    """
+    2リンク平面アームのIK：
+    目標( target_x, target_z )に手先を持っていくための(肩角theta1, 肘角theta2)を返す。
+    """
+    # 目標をベース座標に変換
+    x = target_x - base_x
+    z = target_z - base_z
+
+    r2 = x*x + z*z
+    # 到達可能範囲に収める（遠すぎると届かないため）
+    r = np.sqrt(max(r2, 1e-9))
+    r = np.clip(r, 1e-6, l1 + l2 - 1e-6)
+
+    # 肘角（余弦定理）
+    c2 = (r2 - l1*l1 - l2*l2) / (2*l1*l2)
+    c2 = np.clip(c2, -1, 1)
+    s2 = np.sqrt(1 - c2*c2)
+    if not elbow_up:
+        s2 = -s2
+    theta2 = np.arctan2(s2, c2)
+
+    # 肩角
+    k1 = l1 + l2*c2
+    k2 = l2*s2
+    theta1 = np.arctan2(z, x) - np.arctan2(k2, k1)
+
+    return theta1, theta2
+
+def step_to_joint_targets(theta1, theta2, steps=120):
+    """
+    角度目標（肩・肘）をアクチュエータに入れて、少しずつシミュレーションを進める。
+    """
+    data.ctrl[0] = theta1  # shoulder
+    data.ctrl[1] = theta2  # elbow
+    for _ in range(steps):
+        mujoco.mj_step(model, data)
+```
+
+### ✅ 実際に「手先を赤ブロックの上へ」動かしてみる
+
+```python
+# 赤ブロックの位置を取得
+rb = get_body_xpos("red_block")
+target_x = float(rb[0])
+target_z = float(rb[2] + 0.10)  # 10cm上を狙う（少し浮かせる）
+
+th1, th2 = planar_ik(target_x, target_z)
+step_to_joint_targets(th1, th2, steps=200)
+
+show(render_rgb())
+print("EE now:", get_site_xpos("ee"))
+```
+
+***
+
+## Step 7) “つかむ”を簡単化（吸着方式）
+
+### ✅ 用語解説：「把持（grasp）」を簡単にする理由
+
+本格的な把持は難しい（指・摩擦・接触…）。  
+初心者ハンズオンでは「動かす」成功体験が大事なので、ここでは **吸着**にします。
+
+*   手先がブロックに近い → 「持った」ことにする（held=True）
+*   held=Trueの間、ブロックを手先にくっつけて移動
+*   releaseで離す
+
+```python
+def find_freejoint_qpos_addr(body_name):
+    """
+    freejoint を持つ body の qpos の開始位置を探す。
+    free bodyのqposは [x,y,z, qw,qx,qy,qz] の7要素。
+    """
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    jadr = model.body_jntadr[bid]
+    jnum = model.body_jntnum[bid]
+    assert jnum == 1, "expected one joint for this body"
+    jid = jadr  # このbodyの最初のjoint id
+    return model.jnt_qposadr[jid]
+
+red_qadr = find_freejoint_qpos_addr("red_block")
+
+def set_red_block_pose(pos_xyz, quat_wxyz=(1,0,0,0)):
+    data.qpos[red_qadr:red_qadr+3] = np.array(pos_xyz)
+    data.qpos[red_qadr+3:red_qadr+7] = np.array(quat_wxyz)
+    # 速度はリセットして安定化
+    data.qvel[:] *= 0
+    mujoco.mj_forward(model, data)
+
+held = False
+
+def grasp_if_close(threshold=0.05):
+    """
+    手先とブロックがthreshold以内なら持ったことにする。
+    """
+    global held
+    ee = get_site_xpos("ee")
+    rb = get_body_xpos("red_block")
+    if np.linalg.norm(ee - rb) < threshold:
+        held = True
+    return held
+
+def release():
+    global held
+    held = False
+
+def follow_if_held():
+    """
+    held中は、ブロックを手先に追従させる。
+    """
+    if held:
+        ee = get_site_xpos("ee")
+        set_red_block_pose([ee[0], ee[1], max(0.02, ee[2]-0.02)])
+```
+
+***
+
+## Step 8) Gemini Robotics‑ER 1.5 に「計画」を作らせる
+
+### ✅ 用語解説：「計画（plan）」とは？
+
+ロボットに何かをさせるとき、いきなり全部を動かすのではなく、普通は
+
+1.  赤ブロックの上へ移動
+2.  もう少し下げる
+3.  つかむ
+4.  箱の上へ移動
+5.  もう少し下げる
+6.  離す
+
+みたいに **手順のリスト**にします。これが「計画」です。  
+ER 1.5は、こうした計画を作る“高レベル脳”として提供されています。 [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/), [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/), [\[binaryverseai.com\]](https://binaryverseai.com/gemini-robotics-1-5-embodied-reasoning/)
+
+### 8.1 ER 1.5 を呼び出す準備
+
+````python
+import json
+from google import genai
+from google.genai import types
+
+MODEL_ER = "gemini-robotics-er-1.5-preview"  # preview 
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+def parse_json(text: str):
+    # ```json フェンスが付く場合に備える（Quickstart由来）
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "```json":
+            text = "\n".join(lines[i+1:])
+            text = text.split("```")[0]
+            break
+    return json.loads(text)
+````
+
+### 8.2 状態（state）を作ってERへ渡す
+
+今回は初心者向けに、MuJoCoの「真値座標」をそのまま渡します（認識は省略して“動かす”に集中）。
+
+```python
+GOAL = "Pick the red_block and place it onto the center of the blue_bin."
+
+def get_scene_state():
+    rb = get_body_xpos("red_block").tolist()
+    bin_pos = get_geom_pos("blue_bin").tolist()
+    ee = get_site_xpos("ee").tolist()
+    return {"red_block_pos": rb, "blue_bin_pos": bin_pos, "ee_pos": ee}
+
+PLAN_PROMPT = """
+You are a robotics task planner.
+Return JSON ONLY (no code fences).
+
+Create a minimal plan using these actions only:
+- move_ee: {"action":"move_ee","x":<float>,"z":<float>,"note":"..."}
+- grasp:   {"action":"grasp","note":"..."}
+- release: {"action":"release","note":"..."}
+Max 8 steps.
+
+Robot moves in x-z plane. Use these safe ranges:
+- x in [-0.2, 0.65]
+- z in [0.02, 0.20]
+"""
+
+def make_plan(goal, state):
+    prompt = PLAN_PROMPT + "\nGOAL:\n" + goal + "\nSTATE:\n" + json.dumps(state)
+    res = client.models.generate_content(
+        model=MODEL_ER,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            thinking_config=types.ThinkingConfig(thinking_budget=256)
+        ),
+    )
+    return parse_json(res.text)
+
+state0 = get_scene_state()
+plan = make_plan(GOAL, state0)
+plan
+```
+
+***
+
+## Step 9) 計画を実行して“本当に動かす”（メイン）
+
+ERが返した `plan` を順番に実行します。
+
+```python
+def move_ee_to(x, z, elbow_up=True):
+    th1, th2 = planar_ik(target_x=x, target_z=z, elbow_up=elbow_up)
+    step_to_joint_targets(th1, th2, steps=120)
+
+def execute_plan(plan_json, record=True):
+    frames = []
+    global held
+    held = False
+
+    for st in plan_json["plan"]:
+        act = st["action"]
+
+        if act == "move_ee":
+            move_ee_to(float(st["x"]), float(st["z"]))
+        elif act == "grasp":
+            grasp_if_close()
+        elif act == "release":
+            release()
+        else:
+            raise ValueError("unknown action: " + act)
+
+        # 動作が見えるように少しだけ回す（heldなら追従も）
+        for _ in range(40):
+            follow_if_held()
+            mujoco.mj_step(model, data)
+            if record:
+                frames.append(render_rgb())
+
+    return frames
+```
+
+***
+
+## Step 10) GIFにして「動いた！」を確認する
+
+（ここが一番テンション上がるところ）
+
+```python
+# 失敗してもやり直せるように、モデルをリセットしてから実行
+model = mujoco.MjModel.from_xml_string(MODEL_XML)
+data = mujoco.MjData(model)
+mujoco.mj_forward(model, data)
+renderer = mujoco.Renderer(model, height=480, width=640)
+
+# リセット後のアドレス再取得
+red_qadr = find_freejoint_qpos_addr("red_block")
+held = False
+
+frames = execute_plan(plan, record=True)
+
+gif_path = "pick_place.gif"
+imageio.mimsave(gif_path, frames, fps=20)
+print("saved:", gif_path)
+
+from IPython.display import Image as IPyImage, display
+display(IPyImage(filename=gif_path))
+```
+
+***
+
+# つまずきポイント（初心者向けにここだけ見ればOK）
+
+## 1) つかめない（heldがTrueにならない）
+
+原因：手先がブロックに近づけていない  
+対処：`threshold`を少し増やす
+
+```python
+# 0.05 → 0.07 など
+grasp_if_close(threshold=0.07)
+```
+
+または、planの「下げる高さ（z）」が高いことがあります。  
+その場合は、ERプロンプトのz範囲を狭める／「grasp前はz=0.03付近に降ろす」と明示してもOKです。
+
+***
+
+## 2) 手先が届かない（アームが短い）
+
+原因：アーム長（0.25+0.25=0.5）より遠い場所を狙っている  
+対処：XMLの `red_block` や `blue_bin` の x を少し近づける
+
+*   `red_block pos="0.15 ..."` を `0.05` にする
+*   `blue_bin pos="0.45 ..."` を `0.35` にする など
+
+***
+
+## 3) 計画（plan）が変な値を返す
+
+対処：プロンプトに「x,zの範囲」を入れる（すでに入れてあります）  
+それでも崩れる場合は、状態値を丸めて渡す（小数点2桁）と安定します。
+
+***
+
+# まとめ（この第三弾で学べたこと）
+
+*   **MuJoCo（物理シミュレーター）上でロボットを動かす**一連の流れを体験した。 [\[miralab.co.jp\]](https://miralab.co.jp/media/gemini_robotics_deepmind/), [\[watch.impress.co.jp\]](https://www.watch.impress.co.jp/docs/news/1669995.html)
+*   **Gemini Robotics‑ER 1.5**に、目標と状態から **計画（plan）を作らせ**、その計画を実行して動かした。 [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/), [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/), [\[binaryverseai.com\]](https://binaryverseai.com/gemini-robotics-1-5-embodied-reasoning/)
+
+***
+
+## 次の改善（ここからが“物理AIらしさ”が増える）
+
+もし次に一歩だけ進めるなら、初心者でも効果が出るのはこの2つです：
+
+1.  **planを“必ず同じ形”で返すようにプロンプトを強化**（失敗率が下がる）
+2.  “吸着”の代わりに、簡易グリッパー（指の開閉）へ拡張（時間があれば）
+
+***
+
+必要なら、あなたのブログ/記事向けに「ここにスクショ」「ここでGIF」「ここで用語解説ボックス」まで含めて、**Qiitaそのまま貼れる原稿形式**にも整形します。  
+この第三弾、記事の文体は第一弾・第二弾に合わせて \*\*“ですます調”\*\*で統一しますか？
