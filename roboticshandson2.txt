@@ -1,0 +1,555 @@
+以下は、\*\*「第二弾：動画 × 閉ループ（Perceive–Plan–Act–Verify）」\*\*を、\*\*そのままColabで実行できる“完全なハンズオン手順書”\*\*としてまとめたものです。  
+（第一弾でやった **画像→2D座標(point/bbox)をJSONで取得**・**座標は\[y,x]で0–1000正規化**・**thinking\_budget=0で低遅延**という前提を、動画・計画・進捗判定まで拡張します。） [\[developers...leblog.com\]](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/), [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/)
+
+> ⚠️安全に関する注意  
+> Gemini Robotics-ER 1.5 はロボティクス用途を想定したモデルですが、**生成AIは誤ることがあり、実機ロボットは物理的損害を起こし得ます**。本ハンズオンは「実機不要（擬似実行）」で安全に学びますが、実機へ接続する際は安全設計が必須です。  
+> また本モデルは **preview** 提供です。 [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/), [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/) [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/), [\[techcrunch.com\]](https://techcrunch.com/2025/06/24/google-rolls-out-new-gemini-model-that-can-run-on-robots-locally/)
+
+***
+
+# 実機不要！「Gemini Robotics-ER 1.5」で学ぶフィジカルAI入門2
+
+## 動画から状態推定 → 計画 → 進捗判定までの“閉ループ”を作る（所要 90分）
+
+***
+
+## 1. このハンズオンで作るもの（完成形）
+
+**入力**：短い動画（机の上/作業台など、物が複数映る動画）  
+**出力**：
+
+1.  各フレームの物体 `point/bbox`（JSON）
+2.  簡易トラッキング（同一物体ID付与）
+3.  目標に対する **計画（plan）**（JSON）
+4.  擬似ロボットAPI（pick/place等）で **擬似実行**
+5.  各ステップの **進捗(progress)** と **成功判定(success)** による閉ループ制御
+
+Gemini Robotics-ER 1.5 は、視覚・空間理解、計画、進捗推定、ツール呼び出し（ユーザー定義関数含む）を想定した “ロボットの高レベル脳” として説明されています。 [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/), [\[binaryverseai.com\]](https://binaryverseai.com/gemini-robotics-1-5-embodied-reasoning/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/)
+
+***
+
+## 2. 前提条件
+
+*   Google Colab を使えること
+*   Gemini API Key（Google AI Studioで作成）
+*   テスト動画 1本（10〜30秒推奨、mp4推奨）
+
+> 第一弾同様、座標は **\[y,x]形式で0–1000正規化**を使います（画像サイズに依存せず扱えるため）。 [\[developers...leblog.com\]](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/)
+
+***
+
+## 3. 事前準備（Colab）
+
+### 3.1 必要ライブラリのインストール
+
+Colab のセルに貼り付けて実行：
+
+```bash
+%pip -q install -U google-genai pillow matplotlib opencv-python
+```
+
+> もし依存関係のエラーが出たら、第一弾記事と同様に「ランタイムを再起動 → すべてのセルを再実行」で解消することがあります。 [\[developers...leblog.com\]](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/)
+
+***
+
+### 3.2 APIキー設定（Colab Secrets）
+
+公式のQuickstartは `GOOGLE_API_KEY` を推奨しています。  
+第一弾では `GEMINI_API_KEY` を使っていたので、**どちらでも動くように**読み込みます。 [\[techcrunch.com\]](https://techcrunch.com/2025/06/24/google-rolls-out-new-gemini-model-that-can-run-on-robots-locally/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/) [\[developers...leblog.com\]](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/), [\[techcrunch.com\]](https://techcrunch.com/2025/06/24/google-rolls-out-new-gemini-model-that-can-run-on-robots-locally/)
+
+```python
+from google.colab import userdata
+import os
+
+key = userdata.get("GOOGLE_API_KEY") or userdata.get("GEMINI_API_KEY")
+assert key, "Colab Secrets に GOOGLE_API_KEY か GEMINI_API_KEY を設定してください"
+os.environ["GOOGLE_API_KEY"] = key
+print("API Key loaded.")
+```
+
+***
+
+## 4. 動画のアップロード → フレーム抽出（Perceiveの入力を作る）
+
+### 4.1 動画をアップロード
+
+```python
+from google.colab import files
+uploaded = files.upload()
+video_path = next(iter(uploaded.keys()))
+print("uploaded:", video_path)
+```
+
+***
+
+### 4.2 フレームを等間隔で抽出（例：1fps）
+
+動画はフレーム数が多いほどAPIコールが増えるので、まずは **1fpsで10〜20枚程度**に抑えるのがコツです（後で増やせます）。
+
+```python
+import cv2
+import os
+
+out_dir = "frames"
+os.makedirs(out_dir, exist_ok=True)
+
+cap = cv2.VideoCapture(video_path)
+fps = cap.get(cv2.CAP_PROP_FPS)
+total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+duration = total / fps if fps else 0
+print(f"fps={fps:.2f}, frames={total}, duration={duration:.1f}s")
+
+sample_fps = 1.0  # 1秒に1枚
+step = int(round(fps / sample_fps)) if fps else 1
+step = max(step, 1)
+
+frames = []
+idx = 0
+saved = 0
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    if idx % step == 0:
+        # BGR -> RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        path = f"{out_dir}/frame_{saved:04d}.jpg"
+        cv2.imwrite(path, cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+        frames.append(path)
+        saved += 1
+    idx += 1
+cap.release()
+
+print("saved frames:", len(frames))
+print("example:", frames[:3])
+```
+
+***
+
+## 5. 各フレームから物体座標を取得（Perceive）
+
+ここは第一弾の延長です。モデルは `gemini-robotics-er-1.5-preview` を使います。  
+**point** と **bbox** を両方取っておくと、後段のトラッキングが安定します。 [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/), [\[techcrunch.com\]](https://techcrunch.com/2025/06/24/google-rolls-out-new-gemini-model-that-can-run-on-robots-locally/) [\[developers...leblog.com\]](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/)
+
+### 5.1 クライアント初期化 & JSONパーサ
+
+公式Quickstartでは、出力がコードフェンスに入る場合に備えた簡易パーサが紹介されています。 [\[techcrunch.com\]](https://techcrunch.com/2025/06/24/google-rolls-out-new-gemini-model-that-can-run-on-robots-locally/)
+
+````python
+import json
+from google import genai
+from google.genai import types
+
+MODEL = "gemini-robotics-er-1.5-preview"  # preview 
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+def parse_json(text: str):
+    # Quickstart由来の簡易フェンス除去 
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "```json":
+            text = "\n".join(lines[i+1:])
+            text = text.split("```")[0]
+            break
+    return json.loads(text)
+````
+
+***
+
+### 5.2 1フレームから point/bbox を取得する関数
+
+*   座標は **\[y,x] / 0–1000正規化**（第一弾と同様） [\[developers...leblog.com\]](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/)
+*   レイテンシ優先で `thinking_budget=0`（検出タスク向き） [\[developers...leblog.com\]](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/), [\[arxiv.org\]](https://arxiv.org/abs/2510.03342), [\[note.com\]](https://note.com/npaka/n/ne58a3e9152b5)
+
+```python
+def guess_mime(path: str) -> str:
+    ext = path.lower().split(".")[-1]
+    return "image/png" if ext == "png" else "image/jpeg"
+
+DETECT_PROMPT = """
+Detect up to 12 objects in the image.
+Return JSON ONLY (no code fences).
+Format:
+{
+  "objects": [
+    {"label": "<name>", "point": [y, x], "box_2d": [ymin, xmin, ymax, xmax]}
+  ]
+}
+All coordinates must be integers, [y, x] normalized to 0-1000.
+Only include objects actually present.
+"""
+
+def detect_objects(image_path: str):
+    with open(image_path, "rb") as f:
+        img_bytes = f.read()
+    res = client.models.generate_content(
+        model=MODEL,
+        contents=[types.Part.from_bytes(data=img_bytes, mime_type=guess_mime(image_path)),
+                  DETECT_PROMPT],
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            thinking_config=types.ThinkingConfig(thinking_budget=0)  # low latency 
+        ),
+    )
+    return parse_json(res.text)
+```
+
+> `thinking_budget` は 0 で無効化、-1で自動など、トークン予算として制御できます。 [\[note.com\]](https://note.com/npaka/n/ne58a3e9152b5), [\[arxiv.org\]](https://arxiv.org/abs/2510.03342)
+
+***
+
+### 5.3 全フレームに対して検出（数分）
+
+```python
+detections = []
+for i, fp in enumerate(frames):
+    det = detect_objects(fp)
+    det["frame_index"] = i
+    det["frame_path"] = fp
+    detections.append(det)
+
+print("frames:", len(detections))
+print("example keys:", detections[0].keys())
+print("first objects sample:", detections[0]["objects"][:3])
+```
+
+***
+
+## 6. 可視化（検出が正しいか確認）
+
+第一弾と同様に、**0–1000正規化→ピクセル**へ戻して描画します。 [\[developers...leblog.com\]](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/)
+
+```python
+from PIL import Image, ImageDraw
+import matplotlib.pyplot as plt
+
+def to_px_yx(point_yx, W, H):
+    y, x = point_yx
+    px = int(x / 1000 * W)
+    py = int(y / 1000 * H)
+    return px, py
+
+def box_to_px(box, W, H):
+    ymin, xmin, ymax, xmax = box
+    x1 = int(xmin/1000 * W); y1 = int(ymin/1000 * H)
+    x2 = int(xmax/1000 * W); y2 = int(ymax/1000 * H)
+    return x1, y1, x2, y2
+
+def visualize_frame(det, max_labels=12):
+    img = Image.open(det["frame_path"]).convert("RGB")
+    W, H = img.size
+    vis = img.copy()
+    draw = ImageDraw.Draw(vis)
+
+    for obj in det["objects"][:max_labels]:
+        if "box_2d" in obj:
+            x1, y1, x2, y2 = box_to_px(obj["box_2d"], W, H)
+            draw.rectangle((x1, y1, x2, y2), outline="lime", width=3)
+        if "point" in obj:
+            px, py = to_px_yx(obj["point"], W, H)
+            r = 5
+            draw.ellipse((px-r, py-r, px+r, py+r), outline="red", width=3)
+            draw.text((px+6, py+6), obj["label"], fill="red")
+
+    plt.figure(figsize=(10,6))
+    plt.imshow(vis)
+    plt.axis("off")
+    plt.show()
+
+visualize_frame(detections[0])
+```
+
+***
+
+## 7. 簡易トラッキング（同一物体ID付与）
+
+ここからが第二弾の新要素です。  
+連続フレーム間で point の距離が近いものを同一物体として紐づけ、`track_id` を振ります（雑でもOK）。
+
+```python
+import math
+
+def dist(p1, p2):
+    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+
+next_id = 0
+prev_tracks = []  # list of (track_id, label, point)
+
+for det in detections:
+    tracks = []
+    for obj in det["objects"]:
+        if "point" not in obj:
+            continue
+        best = None
+        best_d = 1e9
+
+        for (tid, plabel, ppoint) in prev_tracks:
+            # ラベル一致を優先、ただし揺れ対策で距離閾値も見る
+            d = dist(obj["point"], ppoint)
+            if d < best_d and d < 120:  # 0-1000正規化空間での閾値（適宜調整）
+                best = tid
+                best_d = d
+
+        if best is None:
+            best = next_id
+            next_id += 1
+
+        obj["track_id"] = best
+        tracks.append((best, obj.get("label",""), obj["point"]))
+
+    det["tracks"] = tracks
+    prev_tracks = tracks
+
+print("max track_id:", next_id-1)
+print("example frame0 tracks:", detections[0]["objects"][:3])
+```
+
+***
+
+## 8. 目標（Goal）を定義して、計画（Plan）を生成する
+
+\*\*Gemini Robotics-ER 1.5 は計画立案・進捗推定・成功判定に強い“高レベル脳”\*\*として設計されています。  
+計画生成は「考えるほど良い」局面なので `thinking_budget` を増やします。 [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/), [\[binaryverseai.com\]](https://binaryverseai.com/gemini-robotics-1-5-embodied-reasoning/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/) [\[arxiv.org\]](https://arxiv.org/abs/2510.03342), [\[note.com\]](https://note.com/npaka/n/ne58a3e9152b5)
+
+### 8.1 目標例（机上整理）
+
+*   例：「すべての小物を画面左側のゾーンに寄せる」
+*   例：「箱Aに文房具、箱Bに電子機器を入れる（擬似）」
+
+ここではゾーン分けの単純タスクにします。
+
+```python
+GOAL = """
+Re-organize the tabletop:
+- Put small gadgets (earbuds, mouse, etc.) into Zone_RIGHT.
+- Put stationery (pen, notebook, etc.) into Zone_LEFT.
+If label is unclear, decide based on appearance and common sense.
+"""
+```
+
+### 8.2 計画をJSONで作る
+
+**現在状態**は「最後のフレームの検出結果」を使います（最終状態を片付けたい想定）。
+
+```python
+PLAN_PROMPT_TMPL = """
+You are a robotics high-level planner.
+Given the current scene objects (with ids and positions) and the goal, output a short plan.
+
+Return JSON ONLY:
+{
+  "plan": [
+    {"step": 1, "action": "pick", "target_track_id": <int>, "rationale": "<short>"},
+    {"step": 2, "action": "place", "zone": "Zone_LEFT|Zone_RIGHT", "rationale": "<short>"}
+  ]
+}
+
+Constraints:
+- Use only actions: pick, place.
+- Max 10 steps.
+- Use target_track_id from the input objects.
+- Prefer a robust order (avoid moving the same item twice).
+"""
+
+def make_plan(scene_det, goal_text):
+    # 入力をコンパクト化（トークン節約）
+    objs = [{"track_id": o.get("track_id"), "label": o.get("label"), "point": o.get("point")}
+            for o in scene_det["objects"] if "track_id" in o and "point" in o]
+    prompt = PLAN_PROMPT_TMPL + "\n\nGOAL:\n" + goal_text + "\n\nOBJECTS:\n" + json.dumps(objs, ensure_ascii=False)
+
+    res = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            thinking_config=types.ThinkingConfig(thinking_budget=256)  # 計画は考えさせる 
+        ),
+    )
+    return parse_json(res.text)
+
+current_scene = detections[-1]
+plan_json = make_plan(current_scene, GOAL)
+plan_json
+```
+
+***
+
+## 9. 擬似ロボットAPI（ツール）で“実行”し、進捗判定で閉ループ化
+
+ER 1.5 は「ツール呼び出し」や「進捗推定・成功判定」を含む長手順タスクのオーケストレーションを想定しています。  
+ただし実機は使わないので、ここでは **ワールド状態（辞書）だけ更新**する“擬似実行器”を作ります。 [\[binaryverseai.com\]](https://binaryverseai.com/gemini-robotics-1-5-embodied-reasoning/), [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/)
+
+### 9.1 ワールド状態（簡易）
+
+*   各 `track_id` の所属ゾーンを持たせます（初期は Unknown）
+*   `pick` は「手に持つ」状態、`place` はゾーン更新
+
+```python
+world = {
+    "held": None,
+    "zones": {}  # track_id -> Zone_LEFT / Zone_RIGHT / Unknown
+}
+
+def tool_pick(track_id: int):
+    if world["held"] is not None:
+        return {"ok": False, "msg": "already holding something", "held": world["held"]}
+    world["held"] = track_id
+    return {"ok": True, "msg": f"picked {track_id}", "held": world["held"]}
+
+def tool_place(zone: str):
+    if world["held"] is None:
+        return {"ok": False, "msg": "holding nothing"}
+    tid = world["held"]
+    world["zones"][tid] = zone
+    world["held"] = None
+    return {"ok": True, "msg": f"placed {tid} to {zone}", "zones": world["zones"]}
+```
+
+***
+
+### 9.2 進捗/成功判定（Verify）
+
+進捗推定・成功検出はER 1.5の重要能力として強調されています。 [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/), [\[binaryverseai.com\]](https://binaryverseai.com/gemini-robotics-1-5-embodied-reasoning/)
+
+```python
+VERIFY_PROMPT_TMPL = """
+You are a progress estimator for a robotics task.
+Given the goal and current symbolic world state, estimate progress and success.
+
+Return JSON ONLY:
+{
+  "progress": <float 0..1>,
+  "success": <true|false>,
+  "blocking_issue": "<short or empty>",
+  "next_suggestion": "<short>"
+}
+
+Be conservative: if unsure, lower progress.
+"""
+
+def verify_progress(goal_text: str, world_state: dict):
+    prompt = VERIFY_PROMPT_TMPL + "\n\nGOAL:\n" + goal_text + "\n\nWORLD:\n" + json.dumps(world_state, ensure_ascii=False)
+    res = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            thinking_config=types.ThinkingConfig(thinking_budget=128)  # 判定は中程度 
+        ),
+    )
+    return parse_json(res.text)
+```
+
+***
+
+### 9.3 閉ループ実行（Plan→Act→Verify）
+
+```python
+logs = []
+steps = plan_json.get("plan", [])
+
+for st in steps:
+    act = st.get("action")
+    if act == "pick":
+        out = tool_pick(int(st["target_track_id"]))
+    elif act == "place":
+        out = tool_place(st["zone"])
+    else:
+        out = {"ok": False, "msg": f"unknown action {act}"}
+
+    chk = verify_progress(GOAL, world)
+    logs.append({"step": st, "tool_out": out, "check": chk})
+
+    print(f"step {st.get('step')}: {act} -> {out.get('msg')}")
+    print("  progress:", chk["progress"], "success:", chk["success"], "issue:", chk["blocking_issue"])
+    if chk["success"] is True:
+        print("✅ Goal achieved. Stop loop.")
+        break
+    if chk.get("blocking_issue"):
+        print("⚠️ Blocking issue detected, consider replanning.")
+        # ここで再計画に分岐しても良い（次の発展）
+        # break
+
+logs[-1]
+```
+
+***
+
+## 10. 結果の見える化（任意だが強い）
+
+*   `world["zones"]` を `track_id -> zone` として出して終わりでもOK
+*   さらに「最後のフレーム」にゾーン割当ラベルを描画するとデモとして映えます
+
+```python
+# 最終フレームに track_id と zone を描画
+last = detections[-1]
+img = Image.open(last["frame_path"]).convert("RGB")
+W, H = img.size
+vis = img.copy()
+draw = ImageDraw.Draw(vis)
+
+for o in last["objects"]:
+    if "point" not in o or "track_id" not in o:
+        continue
+    tid = o["track_id"]
+    zone = world["zones"].get(tid, "Unknown")
+    px, py = to_px_yx(o["point"], W, H)
+    draw.text((px+6, py+6), f"id={tid} {zone}", fill="yellow")
+
+plt.figure(figsize=(10,6))
+plt.imshow(vis)
+plt.axis("off")
+plt.show()
+```
+
+***
+
+# 11. うまくいかないとき（トラブルシュート）
+
+## 11.1 JSONがパースできない
+
+*   モデルが \`\`\`json フェンス付きで返す場合があります → `parse_json()` で除去（Quickstart由来） [\[techcrunch.com\]](https://techcrunch.com/2025/06/24/google-rolls-out-new-gemini-model-that-can-run-on-robots-locally/)
+*   それでも崩れる場合は、プロンプトに **“JSON ONLY (no code fences)”** を強めに書く（この手順書はそうしています） [\[developers...leblog.com\]](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/)
+
+## 11.2 ラベルが揺れる（mouse / trackball mouse など）
+
+*   トラッキングは “ラベル一致” ではなく **point距離やbbox重なり**を優先した方が安定します
+*   まずはこの手順書の簡易距離ベースでOK（発展でIOU導入）
+
+## 11.3 遅い／APIコールが多い
+
+*   フレーム数を減らす（1fps→0.5fps）
+*   検出は `thinking_budget=0`（低遅延）にする（第一弾の思想） [\[developers...leblog.com\]](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/), [\[arxiv.org\]](https://arxiv.org/abs/2510.03342), [\[note.com\]](https://note.com/npaka/n/ne58a3e9152b5)
+*   計画だけ `thinking_budget` を上げる（多段推論向き） [\[arxiv.org\]](https://arxiv.org/abs/2510.03342), [\[note.com\]](https://note.com/npaka/n/ne58a3e9152b5), [\[binaryverseai.com\]](https://binaryverseai.com/gemini-robotics-1-5-embodied-reasoning/)
+
+***
+
+# 12. 発展（次の一歩）
+
+この第二弾を足場に、以下へ進むと “Physical AIっぽさ” が一気に増します。
+
+1.  **再計画（Replan）**
+    *   `blocking_issue` が出たら、最新 `world` と `objects` から計画を作り直す
+2.  **成功判定を二重化**
+    *   ERの`success` + ルールベース（例：全track\_idがZoneに入ってるか）
+3.  **Tool useの本格化**（第三弾に繋がる）
+    *   擬似APIを実ロボAPIやシミュレータへ差し替える（ERが司令塔、実行器がAct） [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/), [\[binaryverseai.com\]](https://binaryverseai.com/gemini-robotics-1-5-embodied-reasoning/)
+
+***
+
+# 13. まとめ（第二弾の学び）
+
+*   第一弾の「座標化」を \*\*動画（時間軸）\*\*に拡張し、状態推定→追跡までやった [\[developers...leblog.com\]](https://developers.googleblog.com/building-the-next-generation-of-physical-agents-with-gemini-robotics-er-15/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/)
+*   ER 1.5 の強みである **計画（Plan）** と **進捗/成功判定（Verify）** を組み合わせ、閉ループを作った [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/), [\[binaryverseai.com\]](https://binaryverseai.com/gemini-robotics-1-5-embodied-reasoning/), [\[gearjpn.net\]](https://gearjpn.net/2025/06/27/%e3%80%8c%e3%82%aa%e3%83%95%e3%83%a9%e3%82%a4%e3%83%b3%e3%81%a7%e5%8b%95%e3%81%8f-gemini%e3%80%8d-google%e3%80%81gemini-robotics-on-device-%e3%82%92%e7%99%ba%e8%a1%a8/)
+*   `thinking_budget` を「検出は低く」「計画は高く」で使い分け、遅延と品質を制御した [\[arxiv.org\]](https://arxiv.org/abs/2510.03342), [\[note.com\]](https://note.com/npaka/n/ne58a3e9152b5)
+
+***
+
+## 次の質問（最短で仕上げるために1つだけ）
+
+第二弾の**課題シナリオ**を、記事としてどれに寄せたいですか？（コードは同じでプロンプトだけ差し替えます）
+
+1.  **机上整理（ゾーン分け）**：最も分かりやすい（おすすめ）
+2.  **分別（リサイクル/ゴミ）**：ルールが絡むので“エージェント感”が出る（将来Searchツールに繋げやすい） [\[gigazine.net\]](https://gigazine.net/news/20250625-gemini-robotics-on-device/), [\[binaryverseai.com\]](https://binaryverseai.com/gemini-robotics-1-5-embodied-reasoning/)
+
+希望を教えてくれたら、あなたの第一弾（文体・粒度）に合わせて、**Qiita記事の体裁（見出し・説明文・スクショ差し込み箇所）まで整えた完成原稿**にもできます。
